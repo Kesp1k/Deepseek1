@@ -1,1 +1,258 @@
+name: build
+on: [push, workflow_dispatch]
 
+env:
+  # ===== ЗАМЕНИТЬ на найденные значения =====
+  # Формат chain: последовательность смещений. Резолвится как base+o[0], deref+o[1], deref+o[2]...
+  MATRIX_CHAIN: "0x0,0x0,0x0"     # до Camera.m_CachedViewProjectionMatrix
+  ENTITY_CHAIN: "0x0,0x0"         # до массива указателей на игроков
+  LOCAL_CHAIN:  "0x0,0x0"         # до локального игрока
+  OFF_POS:      "0x18"
+  OFF_TEAM:     "0x24"
+  MY_TEAM:      "0"
+  ENTITY_STRIDE: "8"
+  ENTITY_COUNT:  "64"
+  # =========================================
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scaffold
+        run: |
+          mkdir -p app/src/main/java/com/example/extesp app/src/main/cpp
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.extesp">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <application android:label="ExtESP" android:theme="@android:style/Theme.Material">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".EspOverlay"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/extesp/MainActivity.java <<'EOF'
+          package com.example.extesp;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          public class MainActivity extends Activity {
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  startService(new Intent(this, EspOverlay.class));
+                  new Thread(() -> {
+                      try {
+                          String cmd = "pid=$(pidof com.axlebolt.standoff2); " +
+                                       "chmod 666 /data/local/tmp/esp.dat; " +
+                                       "/data/local/tmp/reader $pid";
+                          Runtime.getRuntime().exec(new String[]{"su","-c",cmd});
+                      } catch (Exception e) { e.printStackTrace(); }
+                  }).start();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/extesp/EspOverlay.java <<'EOF'
+          package com.example.extesp;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.graphics.*;
+          import android.os.IBinder;
+          import android.view.*;
+          import java.io.RandomAccessFile;
+          import java.nio.*;
+          import java.nio.channels.FileChannel;
+          public class EspOverlay extends Service {
+              private WindowManager wm;
+              private View view;
+              private FloatBuffer fb;
+              @Override public void onCreate() {
+                  super.onCreate();
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  try {
+                      RandomAccessFile f = new RandomAccessFile("/data/local/tmp/esp.dat","rw");
+                      fb = f.getChannel().map(FileChannel.MapMode.READ_WRITE,0,8192)
+                            .order(ByteOrder.nativeOrder()).asFloatBuffer();
+                  } catch (Exception e) { stopSelf(); return; }
+                  view = new View(this) {
+                      private final Paint p = new Paint();
+                      private long last = 0;
+                      @Override protected void onDraw(Canvas c) {
+                          if (System.currentTimeMillis()-last < 15) { invalidate(); return; }
+                          last = System.currentTimeMillis();
+                          fb.rewind();
+                          if (fb.get() != 0x45535031f) { invalidate(); return; }
+                          int n = (int) fb.get();
+                          float[] m = new float[16]; fb.get(m);
+                          int W = getWidth(), H = getHeight();
+                          for (int i = 0; i < n; i++) {
+                              float x = fb.get(), y = fb.get(), z = fb.get(); fb.get();
+                              float w = m[3]*x + m[7]*y + m[11]*z + m[15];
+                              if (w < 0.01f) continue;
+                              float nx = (m[0]*x + m[4]*y + m[8]*z + m[12])/w;
+                              float ny = (m[1]*x + m[5]*y + m[9]*z + m[13])/w;
+                              float sx = (nx*0.5f+0.5f)*W;
+                              float sy = (1-(ny*0.5f+0.5f))*H;
+                              if (sx<0||sy<0||sx>W||sy>H) continue;
+                              p.setColor(0xFFFF3030);
+                              p.setStyle(Paint.Style.STROKE);
+                              p.setStrokeWidth(3f);
+                              c.drawRect(sx-30, sy-90, sx+30, sy, p);
+                          }
+                          invalidate();
+                      }
+                  };
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT);
+                  wm.addView(view, lp);
+              }
+              @Override public void onDestroy() { if (view != null) wm.removeView(view); super.onDestroy(); }
+              @Override public IBinder onBind(Intent i) { return null; }
+          }
+          EOF
+
+          cat > app/src/main/cpp/reader.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+
+          static int g_mem;
+          static unsigned long g_base;
+
+          static int rd(unsigned long a, void *b, size_t n) {
+              return pread(g_mem, b, n, (off_t)a) == (ssize_t)n;
+          }
+          static unsigned long find_base(int pid, const char *lib) {
+              char path[64], line[512]; snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+              FILE *f = fopen(path, "r"); if (!f) return 0;
+              unsigned long base = 0;
+              while (fgets(line, sizeof(line), f))
+                  if (strstr(line, lib)) { sscanf(line, "%lx-", &base); break; }
+              fclose(f); return base;
+          }
+          static unsigned long chase(unsigned long base, const unsigned long *c, int n) {
+              unsigned long a = base + c[0];
+              for (int i = 1; i < n; i++) {
+                  unsigned long p = 0;
+                  if (!rd(a, &p, sizeof(p)) || !p) return 0;
+                  a = p + c[i];
+              }
+              return a;
+          }
+
+          /* injected by workflow */
+          static const unsigned long MATRIX_CHAIN[] = { __MATRIX_CHAIN__ };
+          static const unsigned long ENTITY_CHAIN[] = { __ENTITY_CHAIN__ };
+          static const unsigned long LOCAL_CHAIN[]  = { __LOCAL_CHAIN__  };
+          #define OFF_POS       __OFF_POS__
+          #define OFF_TEAM      __OFF_TEAM__
+          #define MY_TEAM       __MY_TEAM__
+          #define ENTITY_STRIDE __ENTITY_STRIDE__
+          #define ENTITY_COUNT  __ENTITY_COUNT__
+
+          int main(int argc, char **argv) {
+              if (argc < 2) return 1;
+              int pid = atoi(argv[1]);
+              char p[64]; snprintf(p, sizeof(p), "/proc/%d/mem", pid);
+              g_mem = open(p, O_RDONLY); if (g_mem < 0) return 1;
+              g_base = find_base(pid, "libil2cpp.so"); if (!g_base) return 1;
+              int out = open("/data/local/tmp/esp.dat", O_RDWR|O_CREAT, 0666);
+              ftruncate(out, 8192);
+              float *shm = mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_SHARED, out, 0);
+              shm[0] = 0x45535031f;
+              for (;;) {
+                  int cnt = 0;
+                  unsigned long maddr = chase(g_base, MATRIX_CHAIN,
+                      sizeof(MATRIX_CHAIN)/sizeof(MATRIX_CHAIN[0]));
+                  if (maddr) rd(maddr, &shm[2], 64);
+                  unsigned long lst = chase(g_base, ENTITY_CHAIN,
+                      sizeof(ENTITY_CHAIN)/sizeof(ENTITY_CHAIN[0]));
+                  if (lst) for (int i = 0; i < ENTITY_COUNT; i++) {
+                      unsigned long ent = 0;
+                      if (!rd(lst + i*ENTITY_STRIDE, &ent, sizeof(ent)) || !ent) continue;
+                      float pos[3]; int team;
+                      if (!rd(ent+OFF_POS, pos, 12)) continue;
+                      if (!rd(ent+OFF_TEAM, &team, 4)) continue;
+                      if (team == MY_TEAM) continue;
+                      float *e = &shm[18 + cnt*4];
+                      e[0]=pos[0]; e[1]=pos[1]; e[2]=pos[2]; e[3]=(float)team;
+                      if (++cnt >= 60) break;
+                  }
+                  shm[1] = (float)cnt;
+                  usleep(16000);
+              }
+          }
+          EOF
+
+          sed -i "s/__MATRIX_CHAIN__/$MATRIX_CHAIN/" app/src/main/cpp/reader.c
+          sed -i "s/__ENTITY_CHAIN__/$ENTITY_CHAIN/" app/src/main/cpp/reader.c
+          sed -i "s/__LOCAL_CHAIN__/$LOCAL_CHAIN/"   app/src/main/cpp/reader.c
+          sed -i "s/__OFF_POS__/$OFF_POS/"           app/src/main/cpp/reader.c
+          sed -i "s/__OFF_TEAM__/$OFF_TEAM/"         app/src/main/cpp/reader.c
+          sed -i "s/__MY_TEAM__/$MY_TEAM/"           app/src/main/cpp/reader.c
+          sed -i "s/__ENTITY_STRIDE__/$ENTITY_STRIDE/" app/src/main/cpp/reader.c
+          sed -i "s/__ENTITY_COUNT__/$ENTITY_COUNT/"   app/src/main/cpp/reader.c
+
+          echo 'include ":app"' > settings.gradle
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.2.0' apply false }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.extesp'
+              compileSdk 34
+              defaultConfig { applicationId "com.example.extesp"; minSdk 24; targetSdk 34; versionCode 1; versionName "1.0" }
+              buildTypes { debug { debuggable true } }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - uses: android-actions/setup-android@v3
+
+      - name: NDK + reader
+        run: |
+          sdkmanager "ndk;26.1.10909125" >/dev/null
+          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+            --target=aarch64-linux-android24 -O2 -o reader app/src/main/cpp/reader.c
+          mkdir -p app/src/main/assets
+          cp reader app/src/main/assets/reader
+
+      - uses: gradle/actions/setup-gradle@v3
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extesp-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
